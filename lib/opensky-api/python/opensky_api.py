@@ -73,96 +73,197 @@ class StateVector(object):
         return pprint.pformat(self.__dict__, indent=4)
 
 
-class OpenSkyStates(object):
-    """ Represents the state of the airspace as seen by OpenSky at a particular time. It has the following fields:
-
-      |  **time** - in seconds since epoch (Unix time stamp). Gives the validity period of all states. All vectors represent the state of a vehicle with the interval :math:`[time - 1, time]`.
-      |  **states** - a list of `StateVector` or is None if there have been no states received
-    """
-    def __init__(self, j):
-        self.__dict__ = j
-        if self.states is not None:
-            self.states = [StateVector(a) for a in self.states]
-        else:
-            self.states = []
-
-    def __repr__(self):
-        return "<OpenSkyStates@%s>" % str(self.__dict__)
-
-    def __str__(self):
-        return pprint.pformat(self.__dict__, indent=4)
-
-
 class OpenSkyApi(object):
     """
-    Main class of the OpenSky Network API. Instances retrieve data from OpenSky via HTTP
+    Classe principal da API OpenSky (versão atualizada com OAuth2)
     """
-    def __init__(self, username=None, password=None):
-        """ Create an instance of the API client. If you do not provide username and password requests will be
-        anonymous which imposes some limitations.
 
-        :param username: an OpenSky username (optional)
-        :param password: an OpenSky password for the given username (optional)
+    def __init__(self, username=None, password=None):
         """
-        if username is not None:
-            self._auth = (username, password)
+        Agora username = client_id
+             password = client_secret
+
+        Mantido para compatibilidade com código antigo.
+        """
+
+        # Guarda as credenciais OAuth2
+        if username and password:
+            self.client_id = username
+            self.client_secret = password
         else:
-            self._auth = ()
+            self.client_id = None
+            self.client_secret = None
+
+        # Token OAuth
+        self._access_token = None
+        self._token_expiry = 0  # timestamp de expiração
+
         self._api_url = "https://opensky-network.org/api"
+
+        # Armazena último request por função
         self._last_requests = defaultdict(lambda: 0)
 
+    # =====================================================
+    # BUSCA E CONTROLE DE TOKEN
+    # =====================================================
+
+    def _get_token(self):
+        """
+        Obtém um token OAuth2 válido.
+        Reutiliza se ainda não expirou.
+        """
+
+        # Se já existe token válido, reutiliza
+        if self._access_token and time.time() < self._token_expiry:
+            return self._access_token
+
+        # Se não tem credenciais, não pode autenticar
+        if not self.client_id or not self.client_secret:
+            return None
+
+        url = "https://auth.opensky-network.org/auth/realms/opensky-network/protocol/openid-connect/token"
+
+        data = {
+            "grant_type": "client_credentials",
+            "client_id": self.client_id,
+            "client_secret": self.client_secret
+        }
+
+        try:
+            r = requests.post(url, data=data, timeout=15)
+
+            if r.status_code != 200:
+                logger.error("Erro ao obter token: %s", r.text)
+                return None
+
+            payload = r.json()
+
+            self._access_token = payload["access_token"]
+
+            # Tempo de expiração (geralmente 1800s)
+            expires = payload.get("expires_in", 1800)
+
+            # Renova 1 min antes de expirar (margem de segurança)
+            self._token_expiry = time.time() + expires - 60
+
+            return self._access_token
+
+        except Exception as e:
+            logger.error("Falha ao buscar token: %s", str(e))
+            return None
+
+    # =====================================================
+    # REQUEST BASE
+    # =====================================================
+
     def _get_json(self, url_post, callee, params=None):
-        r = requests.get("{0:s}{1:s}".format(self._api_url, url_post),
-                         auth=self._auth, params=params, timeout=15.00)
+        """
+        Executa requisição HTTP com OAuth2 automaticamente.
+        """
+
+        headers = {}
+
+        # Se houver token, usa autenticação
+        token = self._get_token()
+
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+
+        r = requests.get(
+            f"{self._api_url}{url_post}",
+            headers=headers,
+            params=params,
+            timeout=15.0
+        )
+
+        # Sucesso
         if r.status_code == 200:
+
             self._last_requests[callee] = time.time()
             return r.json()
+
+        # Token expirou → força renovar
+        elif r.status_code == 401:
+
+            self._access_token = None
+
+            # Tenta novamente uma vez
+            return self._get_json(url_post, callee, params)
+
         else:
-            logger.debug("Response not OK. Status {0:d} - {1:s}".format(r.status_code, r.reason))
+            logger.debug(
+                "Response not OK. Status %d - %s",
+                r.status_code,
+                r.reason
+            )
+
         return None
 
-    def _check_rate_limit(self, time_diff_noauth, time_diff_auth, func):
-        """ impose client-side rate limit
+    # =====================================================
+    # RATE LIMIT
+    # =====================================================
 
-        :param time_diff_noauth: the minimum time between two requests in seconds if not using authentication
-        :param time_diff_auth: the minimum time between two requests in seconds if using authentication
-        :param func: the API function to evaluate
+    def _check_rate_limit(self, time_diff_noauth, time_diff_auth, func):
         """
-        if len(self._auth) < 2:
-            return abs(time.time() - self._last_requests[func]) >= time_diff_noauth
+        Controle de rate-limit local.
+        """
+
+        # Verifica se está autenticado via token
+        is_auth = bool(self._get_token())
+
+        diff = abs(time.time() - self._last_requests[func])
+
+        if not is_auth:
+            # Usuário anônimo
+            return diff >= time_diff_noauth
         else:
-            return abs(time.time() - self._last_requests[func]) >= time_diff_auth
+            # Usuário autenticado
+            return diff >= time_diff_auth
+
+    # =====================================================
+    # VALIDAÇÃO DE COORDENADAS
+    # =====================================================
 
     @staticmethod
     def _check_lat(lat):
         if lat < -90 or lat > 90:
-            raise ValueError("Invalid latitude {:f}! Must be in [-90, 90]".format(lat))
+            raise ValueError(
+                "Latitude inválida {:f}! Deve estar entre [-90, 90]".format(lat)
+            )
 
     @staticmethod
     def _check_lon(lon):
         if lon < -180 or lon > 180:
-            raise ValueError("Invalid longitude {:f}! Must be in [-180, 180]".format(lon))
+            raise ValueError(
+                "Longitude inválida {:f}! Deve estar entre [-180, 180]".format(lon)
+            )
+
+    # =====================================================
+    # API PRINCIPAL
+    # =====================================================
 
     def get_states(self, time_secs=0, icao24=None, serials=None, bbox=()):
-        """ Retrieve state vectors for a given time. If time = 0 the most recent ones are taken.
-        Optional filters may be applied for ICAO24 addresses.
-
-        :param time_secs: time as Unix time stamp (seconds since epoch) or datetime. The datetime must be in UTC!
-        :param icao24: optionally retrieve only state vectors for the given ICAO24 address(es). The parameter can either be a single address as str or an array of str containing multiple addresses
-        :param bbox: optionally retrieve state vectors within a bounding box. The bbox must be a tuple of exactly four values [min_latitude, max_latitude, min_longitude, max_latitude] each in WGS84 decimal degrees.
-        :return: OpenSkyStates if request was successful, None otherwise
         """
+        Obtém estados dos aviões.
+        """
+
         if not self._check_rate_limit(10, 5, self.get_states):
-            logger.debug("Blocking request due to rate limit")
+            logger.debug("Bloqueado por rate limit")
             return None
 
         t = time_secs
+
         if type(time_secs) == datetime:
             t = calendar.timegm(t.timetuple())
 
-        params = {"time": int(t), "icao24": icao24}
+        params = {
+            "time": int(t),
+            "icao24": icao24
+        }
 
+        # Bounding box
         if len(bbox) == 4:
+
             OpenSkyApi._check_lat(bbox[0])
             OpenSkyApi._check_lat(bbox[1])
             OpenSkyApi._check_lon(bbox[2])
@@ -172,36 +273,60 @@ class OpenSkyApi(object):
             params["lamax"] = bbox[1]
             params["lomin"] = bbox[2]
             params["lomax"] = bbox[3]
-        elif len(bbox) > 0:
-            raise ValueError("Invalid bounding box! Must be [min_latitude, max_latitude, min_longitude, max_latitude]")
 
-        states_json = self._get_json("/states/all", self.get_states,
-                                     params=params)
+        elif len(bbox) > 0:
+
+            raise ValueError(
+                "Bounding box inválido! Use: [min_lat, max_lat, min_lon, max_lon]"
+            )
+
+        states_json = self._get_json(
+            "/states/all",
+            self.get_states,
+            params=params
+        )
+
         if states_json is not None:
             return OpenSkyStates(states_json)
+
         return None
 
-    def get_my_states(self, time_secs=0, icao24=None, serials=None):
-        """ Retrieve state vectors for your own sensors. Authentication is required for this operation.
-        If time = 0 the most recent ones are taken. Optional filters may be applied for ICAO24 addresses and sensor
-        serial numbers.
+    # =====================================================
+    # ESTADOS PRÓPRIOS
+    # =====================================================
 
-        :param time_secs: time as Unix time stamp (seconds since epoch) or datetime. The datetime must be in UTC!
-        :param icao24: optionally retrieve only state vectors for the given ICAO24 address(es). The parameter can either be a single address as str or an array of str containing multiple addresses
-        :param serials: optionally retrieve only states of vehicles as seen by the given sensor(s). The parameter can either be a single sensor serial number (int) or a list of serial numbers.
-        :return: OpenSkyStates if request was successful, None otherwise
+    def get_my_states(self, time_secs=0, icao24=None, serials=None):
         """
-        if len(self._auth) < 2:
-            raise Exception("No username and password provided for get_my_states!")
+        Obtém dados dos próprios sensores.
+        Exige autenticação OAuth2.
+        """
+
+        # Verifica autenticação
+        if not self._get_token():
+            raise Exception("Autenticação OAuth2 necessária!")
+
         if not self._check_rate_limit(0, 1, self.get_my_states):
-            logger.debug("Blocking request due to rate limit")
+            logger.debug("Bloqueado por rate limit")
             return None
+
         t = time_secs
+
         if type(time_secs) == datetime:
             t = calendar.timegm(t.timetuple())
-        states_json = self._get_json("/states/own", self.get_my_states,
-                                     params={"time": int(t), "icao24": icao24,
-                                                             "serials": serials})
+
+        params = {
+            "time": int(t),
+            "icao24": icao24,
+            "serials": serials
+        }
+
+        states_json = self._get_json(
+            "/states/own",
+            self.get_my_states,
+            params=params
+        )
+
         if states_json is not None:
             return OpenSkyStates(states_json)
+
         return None
