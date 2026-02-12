@@ -1,48 +1,20 @@
-#!/usr/bin/env python
-# -*- coding: utf-8 -*-
-
-#
-# OpenSky Network API - Cliente atualizado com OAuth2
-# Baseado na implementação oficial
-#
-# Adaptado para novo sistema de autenticação (2025+)
-# Compatível com código antigo
-#
-# Autor original: Markus Fuchs
-# Adaptação: ChatGPT
-#
-
 import calendar
 import logging
 import pprint
 import requests
-import time
-
 from datetime import datetime
 from collections import defaultdict
-
-
-# =====================================================
-# CONFIGURAÇÃO DE LOG
-# =====================================================
+import time
 
 logger = logging.getLogger('opensky_api')
 logger.addHandler(logging.NullHandler())
 
-
-# =====================================================
-# CLASSE: StateVector
-# =====================================================
-
+# [As classes StateVector e OpenSkyStates permanecem IDÊNTICAS para garantir compatibilidade]
 class StateVector(object):
-
-    keys = [
-        "icao24", "callsign", "origin_country", "time_position",
-        "last_contact", "longitude", "latitude", "baro_altitude",
-        "on_ground", "velocity", "heading", "vertical_rate",
-        "sensors", "geo_altitude", "squawk", "spi",
-        "position_source"
-    ]
+    keys = ["icao24", "callsign", "origin_country", "time_position",
+            "last_contact", "longitude", "latitude", "baro_altitude", "on_ground",
+            "velocity", "heading", "vertical_rate", "sensors",
+            "geo_altitude", "squawk", "spi", "position_source"]
 
     def __init__(self, arr):
         self.__dict__ = dict(zip(StateVector.keys, arr))
@@ -53,17 +25,9 @@ class StateVector(object):
     def __str__(self):
         return pprint.pformat(self.__dict__, indent=4)
 
-
-# =====================================================
-# CLASSE: OpenSkyStates
-# =====================================================
-
 class OpenSkyStates(object):
-
     def __init__(self, j):
-
         self.__dict__ = j
-
         if self.states is not None:
             self.states = [StateVector(a) for a in self.states]
         else:
@@ -75,310 +39,112 @@ class OpenSkyStates(object):
     def __str__(self):
         return pprint.pformat(self.__dict__, indent=4)
 
-
-# =====================================================
-# CLASSE PRINCIPAL: OpenSkyApi
-# =====================================================
-
 class OpenSkyApi(object):
-
     """
-    Cliente principal da API OpenSky (com OAuth2)
+    Main class of the OpenSky Network API. 
+    Atualizada para suportar autenticação baseada em sessão conforme novas regras.
     """
-
-    # =====================================================
-    # CONSTRUTOR
-    # =====================================================
-
     def __init__(self, username=None, password=None):
-
-        """
-        Agora:
-        username = client_id
-        password = client_secret
-
-        Mantido para compatibilidade.
-        """
-
-        if username and password:
-
-            # Credenciais OAuth2
-            self.client_id = username
-            self.client_secret = password
-
-        else:
-
-            self.client_id = None
-            self.client_secret = None
-
-        # Token e validade
-        self._access_token = None
-        self._token_expiry = 0
-
         self._api_url = "https://opensky-network.org/api"
-
         self._last_requests = defaultdict(lambda: 0)
+        self._username = username
+        self._password = password
+        self._session = requests.Session() # Uso de sessão para manter cookies/tokens
+        
+        if username and password:
+            # Tenta realizar o login inicial para obter o cookie de sessão (JSESSIONID)
+            # que é o método preferencial atual em vez de Basic Auth repetitivo.
+            self._login()
 
-
-    # =====================================================
-    # OBTÉM TOKEN OAUTH2
-    # =====================================================
-
-    def _get_token(self):
-
-        """
-        Busca token OAuth2 e reutiliza enquanto válido
-        """
-
-        # Token ainda válido
-        if self._access_token and time.time() < self._token_expiry:
-            return self._access_token
-
-        # Sem credenciais → modo anônimo
-        if not self.client_id or not self.client_secret:
-            return None
-
-        url = "https://auth.opensky-network.org/auth/realms/opensky-network/protocol/openid-connect/token"
-
-        data = {
-            "grant_type": "client_credentials",
-            "client_id": self.client_id,
-            "client_secret": self.client_secret
-        }
-
+    def _login(self):
+        """ Realiza o login para obter um token de sessão """
         try:
-
-            r = requests.post(url, data=data, timeout=15)
-
-            if r.status_code != 200:
-
-                logger.error("Erro ao obter token: %s", r.text)
-                return None
-
-            payload = r.json()
-
-            self._access_token = payload["access_token"]
-
-            expires = payload.get("expires_in", 1800)
-
-            # Margem de segurança (1 min)
-            self._token_expiry = time.time() + expires - 60
-
-            return self._access_token
-
+            # A API da OpenSky muitas vezes valida o Basic Auth na primeira requisição
+            # e mantém a sessão via Cookie.
+            auth = (self._username, self._password)
+            r = self._session.get(f"{self._api_url}/states/own", auth=auth, timeout=10)
+            if r.status_code == 200:
+                logger.info("Login bem-sucedido via sessão.")
+            else:
+                logger.warning(f"Falha na autenticação inicial: {r.status_code}")
         except Exception as e:
-
-            logger.error("Falha ao buscar token: %s", str(e))
-            return None
-
-
-    # =====================================================
-    # REQUEST BASE
-    # =====================================================
+            logger.error(f"Erro ao tentar autenticar: {e}")
 
     def _get_json(self, url_post, callee, params=None):
-
-        """
-        Executa requisição HTTP
-        com Bearer Token se disponível
-        """
-
-        headers = {}
-
-        token = self._get_token()
-
-        # Se tiver token, autentica
-        if token:
-
-            headers["Authorization"] = f"Bearer {token}"
-
-        r = requests.get(
-            f"{self._api_url}{url_post}",
-            headers=headers,
-            params=params,
-            timeout=15.0
-        )
-
-        # Sucesso
-        if r.status_code == 200:
-
-            self._last_requests[callee] = time.time()
-
-            return r.json()
-
-        # Token inválido → renova
-        elif r.status_code == 401:
-
-            self._access_token = None
-
-            return self._get_json(url_post, callee, params)
-
-        else:
-
-            logger.debug(
-                "Erro HTTP %d - %s",
-                r.status_code,
-                r.reason
-            )
-
+        # Se não houver credenciais, não envia auth (acesso anônimo)
+        auth = (self._username, self._password) if self._username else None
+        
+        try:
+            # O objeto self._session gerencia automaticamente os cookies de login
+            r = self._session.get("{0:s}{1:s}".format(self._api_url, url_post),
+                                 auth=auth, params=params, timeout=15.00)
+            
+            if r.status_code == 200:
+                self._last_requests[callee] = time.time()
+                return r.json()
+            elif r.status_code == 401:
+                logger.error("Erro 401: Não autorizado. Verifique suas credenciais.")
+            elif r.status_code == 429:
+                logger.warning("Erro 429: Limite de requisições excedido (Rate Limit).")
+            else:
+                logger.debug("Response not OK. Status {0:d} - {1:s}".format(r.status_code, r.reason))
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Erro de conexão: {e}")
+            
         return None
 
-
-    # =====================================================
-    # RATE LIMIT
-    # =====================================================
-
     def _check_rate_limit(self, time_diff_noauth, time_diff_auth, func):
-
-        """
-        Controle local de taxa
-        """
-
-        # Está autenticado?
-        is_auth = bool(self._get_token())
-
-        diff = abs(time.time() - self._last_requests[func])
-
-        if not is_auth:
-
-            return diff >= time_diff_noauth
-
+        # Mantém a lógica original para não quebrar o fluxo da aplicação
+        if not self._username:
+            return abs(time.time() - self._last_requests[func]) >= time_diff_noauth
         else:
-
-            return diff >= time_diff_auth
-
-
-    # =====================================================
-    # VALIDAÇÃO DE LAT/LON
-    # =====================================================
+            return abs(time.time() - self._last_requests[func]) >= time_diff_auth
 
     @staticmethod
     def _check_lat(lat):
-
         if lat < -90 or lat > 90:
-
-            raise ValueError(
-                "Latitude inválida {:f}".format(lat)
-            )
-
+            raise ValueError("Invalid latitude {:f}! Must be in [-90, 90]".format(lat))
 
     @staticmethod
     def _check_lon(lon):
-
         if lon < -180 or lon > 180:
-
-            raise ValueError(
-                "Longitude inválida {:f}".format(lon)
-            )
-
-
-    # =====================================================
-    # GET STATES
-    # =====================================================
+            raise ValueError("Invalid longitude {:f}! Must be in [-180, 180]".format(lon))
 
     def get_states(self, time_secs=0, icao24=None, serials=None, bbox=()):
-
-        """
-        Obtém estados das aeronaves
-        """
-
         if not self._check_rate_limit(10, 5, self.get_states):
-
-            logger.debug("Rate limit ativo")
+            logger.debug("Blocking request due to rate limit")
             return None
 
-
         t = time_secs
-
-        if type(time_secs) == datetime:
-
+        if isinstance(time_secs, datetime):
             t = calendar.timegm(t.timetuple())
 
-
-        params = {
-            "time": int(t),
-            "icao24": icao24
-        }
-
+        params = {"time": int(t), "icao24": icao24}
 
         if len(bbox) == 4:
-
             OpenSkyApi._check_lat(bbox[0])
             OpenSkyApi._check_lat(bbox[1])
             OpenSkyApi._check_lon(bbox[2])
             OpenSkyApi._check_lon(bbox[3])
-
-            params["lamin"] = bbox[0]
-            params["lamax"] = bbox[1]
-            params["lomin"] = bbox[2]
-            params["lomax"] = bbox[3]
-
+            params.update({"lamin": bbox[0], "lamax": bbox[1], "lomin": bbox[2], "lomax": bbox[3]})
         elif len(bbox) > 0:
+            raise ValueError("Invalid bounding box! Must be [min_latitude, max_latitude, min_longitude, max_latitude]")
 
-            raise ValueError("Bounding box inválido")
-
-
-        states_json = self._get_json(
-            "/states/all",
-            self.get_states,
-            params=params
-        )
-
-
-        if states_json is not None:
-
-            return OpenSkyStates(states_json)
-
-
-        return None
-
-
-    # =====================================================
-    # GET MY STATES
-    # =====================================================
+        states_json = self._get_json("/states/all", self.get_states, params=params)
+        return OpenSkyStates(states_json) if states_json else None
 
     def get_my_states(self, time_secs=0, icao24=None, serials=None):
-
-        """
-        Obtém dados dos sensores próprios
-        """
-
-        # Exige autenticação
-        if not self._get_token():
-
-            raise Exception("Autenticação OAuth2 necessária")
-
-
+        if not self._username:
+            raise Exception("No username and password provided for get_my_states!")
+        
         if not self._check_rate_limit(0, 1, self.get_my_states):
-
-            logger.debug("Rate limit ativo")
+            logger.debug("Blocking request due to rate limit")
             return None
-
-
+            
         t = time_secs
-
-        if type(time_secs) == datetime:
-
+        if isinstance(time_secs, datetime):
             t = calendar.timegm(t.timetuple())
-
-
-        params = {
-            "time": int(t),
-            "icao24": icao24,
-            "serials": serials
-        }
-
-
-        states_json = self._get_json(
-            "/states/own",
-            self.get_my_states,
-            params=params
-        )
-
-
-        if states_json is not None:
-
-            return OpenSkyStates(states_json)
-
-
-        return None
+            
+        states_json = self._get_json("/states/own", self.get_my_states,
+                                     params={"time": int(t), "icao24": icao24, "serials": serials})
+        return OpenSkyStates(states_json) if states_json else None
