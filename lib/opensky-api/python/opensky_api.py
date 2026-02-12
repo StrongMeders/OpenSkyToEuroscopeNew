@@ -44,7 +44,7 @@ class OpenSkyApi(object):
     Main class of the OpenSky Network API. 
     Atualizada para suportar autenticação baseada em sessão conforme novas regras.
     """
-    def __init__(self, username=None, password=None):
+    def __init__(self, username="SEU_USUARIO_FIXO", password="SUA_PASSWORD_FIXA"):
         self._api_url = "https://opensky-network.org/api"
         self._last_requests = defaultdict(lambda: 0)
         self._username = username
